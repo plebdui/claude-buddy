@@ -1,0 +1,178 @@
+#!/usr/bin/env python3
+"""Ask the local LM Studio model to draw a tiny ASCII toy for Claude Buddy.
+
+    claude-buddy-craft "rubber duck"            -> prints JSON {"options": [...]}
+    claude-buddy-craft --count 4 "rubber duck"
+
+Small models are hit-and-miss at ASCII art, so this asks several times,
+throws away drawings that are too big or broken, and returns the rest
+for you to choose from. A toy you've already got (saved in
+~/.config/claude-buddy/toys/) is always offered first.
+"""
+import argparse
+import json
+import os
+import re
+import subprocess
+import time
+import urllib.error
+import urllib.request
+
+SERVER = "http://localhost:1234/v1"
+LMS = os.path.expanduser("~/.lmstudio/bin/lms")
+TOYS_DIR = os.path.expanduser("~/.config/claude-buddy/toys")
+MODEL_FILE = os.path.expanduser("~/.config/claude-buddy/model.txt")
+
+MAX_LINES = 5
+MAX_WIDTH = 14
+
+SYSTEM = """You draw tiny ASCII art toys for a little desktop pet.
+Rules:
+- 2 to 4 lines tall, at most 12 characters wide.
+- Draw the object's recognisable outline, side view.
+- Plain ASCII only. No words, labels or notes.
+- Reply with ONLY a ``` code block."""
+
+# Hand-drawn examples. The model copies their size and style.
+EXAMPLES = [
+    ("rubber duck", "   __\n <(o )___\n  ( ._> /\n   `---'"),
+    ("fish", "  ,/..\n<')   `=<\n  ``\\```"),
+    ("guitar", "      ,\n  .--/=\n (::/\n  `'"),
+    ("sword", "o==[]::::::>"),
+    ("ball", "  .-.\n (   )\n  `-'"),
+    ("car", "  ______\n /|_||_\\`.__\n(   _    _ _\\\n=`-(_)--(_)-'"),
+    ("heart", " .-. .-.\n(   '   )\n `.   .'\n   `.'"),
+]
+
+
+def slug(name):
+    return re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-") or "toy"
+
+
+def post(path, body, timeout=120):
+    req = urllib.request.Request(SERVER + path, json.dumps(body).encode(),
+                                 {"Content-Type": "application/json"})
+    return json.load(urllib.request.urlopen(req, timeout=timeout))
+
+
+def ensure_server():
+    """Start LM Studio's local server if it isn't running yet."""
+    try:
+        urllib.request.urlopen(SERVER + "/models", timeout=3)
+        return
+    except (urllib.error.URLError, OSError):
+        pass
+    subprocess.run([LMS, "server", "start"], capture_output=True, timeout=60)
+    for _ in range(20):
+        try:
+            urllib.request.urlopen(SERVER + "/models", timeout=3)
+            return
+        except (urllib.error.URLError, OSError):
+            time.sleep(0.5)
+    raise RuntimeError("LM Studio's server didn't start")
+
+
+def pick_model():
+    """Which LM Studio model draws the toys.
+
+    Put a model name in ~/.config/claude-buddy/model.txt to choose one yourself.
+    Otherwise: skip embedding and image models, prefer "instruct" models (they
+    answer straight away), and avoid big "thinking" models like Qwen3.6, which
+    spend their whole answer thinking out loud and never get to the drawing.
+    """
+    models = [m["id"] for m in
+              json.load(urllib.request.urlopen(SERVER + "/models", timeout=10))["data"]]
+    if os.path.exists(MODEL_FILE):
+        with open(MODEL_FILE) as f:
+            wanted = f.read().strip()
+        if wanted in models:
+            return wanted
+    chat = [m for m in models if not re.search(r"embed|image|vision|whisper", m, re.I)]
+    if not chat:
+        raise RuntimeError("no chat model found in LM Studio")
+
+    def score(m):
+        s = 0
+        if "instruct" in m.lower():
+            s -= 2
+        if re.search(r"qwen3\.[5-9]|thinking|reason|r1\b|\b(1[4-9]|[2-9]\d|\d{3})b\b", m, re.I):
+            s += 3  # thinking / huge models: slow, and often answer with only thoughts
+        return s
+    return min(chat, key=score)
+
+
+def clean(reply):
+    """Pull the drawing out of the reply. Returns None if it's no good."""
+    block = re.search(r"```[^\n]*\n(.*?)(```|$)", reply, re.S)
+    text = block.group(1) if block else reply
+    lines = [l.rstrip() for l in text.split("\n")]
+    while lines and not lines[0].strip():
+        lines.pop(0)
+    while lines and not lines[-1].strip():
+        lines.pop()
+    if not lines or len(lines) > MAX_LINES:
+        return None
+    # Shift everything left so the drawing starts at column 0.
+    indent = min(len(l) - len(l.lstrip()) for l in lines if l.strip())
+    lines = [l[indent:] for l in lines]
+    art = "\n".join(lines)
+    if max(len(l) for l in lines) > MAX_WIDTH:
+        return None
+    if any(not (32 <= ord(c) < 127) for c in art.replace("\n", "")):
+        return None                       # not plain ASCII
+    if re.search(r"[A-Za-z]{4,}", art):
+        return None                       # has words in it
+    if sum(not c.isspace() for c in art) < 4:
+        return None                       # basically empty
+    for i in range(len(lines) - 2):       # the same line over and over
+        if lines[i].strip() and lines[i] == lines[i + 1] == lines[i + 2]:
+            return None
+    return art
+
+
+def draw(model, name, temperature):
+    messages = [{"role": "system", "content": SYSTEM}]
+    for example, art in EXAMPLES:
+        messages += [{"role": "user", "content": example},
+                     {"role": "assistant", "content": f"```\n{art}\n```"}]
+    messages.append({"role": "user", "content": name})
+    reply = post("/chat/completions", {
+        "model": model, "messages": messages, "temperature": temperature,
+        "max_tokens": 90, "stop": ["```\n\n"],
+    })
+    return clean(reply["choices"][0]["message"]["content"])
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--count", type=int, default=4)
+    parser.add_argument("--skip-saved", action="store_true",
+                        help="don't offer the drawing you already have")
+    parser.add_argument("name", nargs="+")
+    args = parser.parse_args()
+    name = " ".join(args.name).strip()
+
+    options = []
+    saved = os.path.join(TOYS_DIR, slug(name) + ".txt")
+    if os.path.exists(saved) and not args.skip_saved:
+        with open(saved) as f:
+            options.append(f.read().rstrip("\n"))
+
+    try:
+        ensure_server()
+        model = pick_model()
+        tries = 0
+        while len(options) < args.count and tries < args.count * 3:
+            # Start careful, get more adventurous with each try.
+            art = draw(model, name, 0.4 + 0.08 * tries)
+            tries += 1
+            if art and art not in options:
+                options.append(art)
+    except Exception as e:  # report it to the extension instead of crashing
+        print(json.dumps({"name": name, "options": options, "error": str(e)}))
+        return
+    print(json.dumps({"name": name, "options": options}))
+
+
+if __name__ == "__main__":
+    main()

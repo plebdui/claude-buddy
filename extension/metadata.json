@@ -1,0 +1,6 @@
+{
+  "uuid": "claude-buddy@machine_face",
+  "name": "Claude Buddy",
+  "description": "The Claude Code mascot walks along the top of the taskbar. Hover for a greeting, click to start Claude Code.",
+  "shell-version": ["48", "49", "50"]
+}
